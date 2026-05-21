@@ -1,0 +1,307 @@
+name: Build Android Binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      tools_repo:
+        description: 'Repository with build tools (owner/repo or full URL)'
+        required: true
+        type: string
+        default: 'omrxdev/tools-repo'
+      tools_ref:
+        description: 'Branch/tag/commit for tools repo'
+        required: false
+        type: string
+        default: 'main'
+      
+      source_repo:
+        description: 'Repository with Rust source code'
+        required: true
+        type: string
+        default: 'omrxdev/omrxmodule-mount'
+      source_ref:
+        description: 'Branch/tag/commit for source repo'
+        required: false
+        type: string
+        default: 'main'
+      source_subdir:
+        description: 'Subdirectory containing Cargo.toml (leave empty to auto-detect)'
+        required: false
+        type: string
+        default: ''
+      
+      binary_name:
+        description: 'Name of the Rust binary'
+        required: false
+        type: string
+        default: 'omrxmodule-mount'
+      
+      ndk_version:
+        description: 'Android NDK version'
+        required: false
+        type: string
+        default: 'r26d'
+      
+      android_api:
+        description: 'Android API level'
+        required: false
+        type: string
+        default: '29'
+      
+      rust_target:
+        description: 'Rust target triple'
+        required: false
+        type: string
+        default: 'aarch64-linux-android'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Parse repository names
+        id: parse
+        run: |
+          parse_repo() {
+            local input="$1"
+            local cleaned=$(echo "$input" | sed -E 's|https://github\.com/||; s|git@github\.com:||; s|\.git$||')
+            echo "$cleaned"
+          }
+          
+          TOOLS_REPO=$(parse_repo "${{ github.event.inputs.tools_repo }}")
+          SOURCE_REPO=$(parse_repo "${{ github.event.inputs.source_repo }}")
+          
+          echo "TOOLS_REPO=$TOOLS_REPO" >> $GITHUB_OUTPUT
+          echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_OUTPUT
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.parse.outputs.TOOLS_REPO }}
+          ref: ${{ github.event.inputs.tools_ref || 'main' }}
+          path: tools-repo
+          token: ${{ secrets.REPO_PAT || github.token }}
+
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.parse.outputs.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.source_ref || 'main' }}
+          path: source-repo
+          token: ${{ secrets.REPO_PAT || github.token }}
+
+      - name: Explore repository structure
+        run: |
+          echo "=== Source Repository Structure ==="
+          find source-repo -maxdepth 4 -type f \( -name "*.toml" -o -name "*.sh" -o -name "*.rs" \) | sort
+          echo ""
+          echo "=== All Cargo.toml files ==="
+          find source-repo -name "Cargo.toml" -type f
+          echo ""
+          echo "=== All shell scripts ==="
+          find source-repo -name "*.sh" -type f
+
+      - name: Auto-detect or use specified subdirectory
+        id: detect
+        run: |
+          USER_SUBDIR="${{ github.event.inputs.source_subdir }}"
+          
+          if [ -n "$USER_SUBDIR" ]; then
+            PROJECT_DIR="source-repo/$USER_SUBDIR"
+            if [ -f "$PROJECT_DIR/Cargo.toml" ]; then
+              echo "Found Cargo.toml in user-specified directory"
+              echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_OUTPUT
+            else
+              echo "ERROR: No Cargo.toml found in: $PROJECT_DIR"
+              exit 1
+            fi
+          else
+            # Auto-detect: find Cargo.toml
+            if [ -f "source-repo/Cargo.toml" ]; then
+              echo "PROJECT_DIR=source-repo" >> $GITHUB_OUTPUT
+            else
+              CARGO_TOML=$(find source-repo -name "Cargo.toml" -type f | head -1)
+              if [ -n "$CARGO_TOML" ]; then
+                PROJECT_DIR=$(dirname "$CARGO_TOML")
+                echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_OUTPUT
+              else
+                echo "ERROR: No Cargo.toml found!"
+                exit 1
+              fi
+            fi
+          fi
+
+      - name: Show detected project
+        run: |
+          PROJECT_DIR="${{ steps.detect.outputs.PROJECT_DIR }}"
+          echo "Project directory: $PROJECT_DIR"
+          echo ""
+          echo "=== Contents ==="
+          ls -la "$PROJECT_DIR"
+          echo ""
+          echo "=== Cargo.toml ==="
+          cat "$PROJECT_DIR/Cargo.toml"
+          echo ""
+          echo "=== Build scripts found ==="
+          find "$PROJECT_DIR" -maxdepth 1 -name "*.sh" -type f || echo "No .sh files in project dir"
+          echo ""
+          echo "=== Binary names ==="
+          grep -A 2 "\[\[bin\]\]" "$PROJECT_DIR/Cargo.toml" 2>/dev/null || echo "No explicit bin sections"
+          grep '"name"' "$PROJECT_DIR/Cargo.toml" 2>/dev/null || echo "No name field"
+
+      - name: Set build variables
+        run: |
+          echo "BINARY_NAME=${{ github.event.inputs.binary_name || 'omrxmodule-mount' }}" >> $GITHUB_ENV
+          echo "ANDROID_API=${{ github.event.inputs.android_api || '29' }}" >> $GITHUB_ENV
+          echo "RUST_TARGET=${{ github.event.inputs.rust_target || 'aarch64-linux-android' }}" >> $GITHUB_ENV
+          echo "PROJECT_DIR=${{ steps.detect.outputs.PROJECT_DIR }}" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        run: rustup target add ${{ env.RUST_TARGET }}
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ github.event.inputs.ndk_version || 'r26d' }}
+          add-to-path: false
+        id: setup-ndk
+
+      - name: Find build script
+        id: find-script
+        run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+          
+          # Look for build.sh in priority order
+          # 1. In the project directory (next to Cargo.toml)
+          # 2. In tools repo
+          POSSIBLE_SCRIPTS=(
+            "$PROJECT_DIR/build.sh"
+            "$PROJECT_DIR/scripts/build.sh"
+            "tools-repo/build.sh"
+            "tools-repo/scripts/build.sh"
+          )
+          
+          for script in "${POSSIBLE_SCRIPTS[@]}"; do
+            echo "Checking: $script"
+            if [ -f "$script" ]; then
+              echo "Found build script at: $script"
+              echo "BUILD_SCRIPT=$script" >> $GITHUB_OUTPUT
+              echo "USE_CUSTOM_SCRIPT=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+          
+          echo "No custom build script found, will use cargo directly"
+          echo "USE_CUSTOM_SCRIPT=false" >> $GITHUB_OUTPUT
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.PROJECT_DIR }}/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles(format('{0}/Cargo.lock', env.PROJECT_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build with custom script
+        if: steps.find-script.outputs.USE_CUSTOM_SCRIPT == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          BUILD_SCRIPT="${{ steps.find-script.outputs.BUILD_SCRIPT }}"
+          echo "Current directory: $(pwd)"
+          echo "Build script path: $BUILD_SCRIPT"
+          echo "Script exists: $([ -f "$BUILD_SCRIPT" ] && echo 'YES' || echo 'NO')"
+          
+          # If the script is in tools-repo, use full path
+          # If it's in project dir, just use ./build.sh
+          if [[ "$BUILD_SCRIPT" == *"tools-repo"* ]]; then
+            chmod +x "$BUILD_SCRIPT"
+            bash "$BUILD_SCRIPT"
+          else
+            chmod +x ./build.sh
+            bash ./build.sh
+          fi
+
+      - name: Build with cargo directly
+        if: steps.find-script.outputs.USE_CUSTOM_SCRIPT == 'false'
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CC_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang
+          CXX_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang++
+          AR_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang
+        run: |
+          echo "Building with cargo directly..."
+          cargo build --release --target "$RUST_TARGET"
+
+      - name: Find and collect binary
+        run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+          BINARY_NAME="${{ env.BINARY_NAME }}"
+          
+          echo "Looking for binary: $BINARY_NAME"
+          
+          # Check if build.sh already copied it to project root
+          if [ -f "$PROJECT_DIR/$BINARY_NAME" ]; then
+            echo "Found binary in project root (probably placed by build.sh)"
+            cp "$PROJECT_DIR/$BINARY_NAME" "./$BINARY_NAME"
+          # Check target directory
+          elif [ -f "$PROJECT_DIR/target/${{ env.RUST_TARGET }}/release/$BINARY_NAME" ]; then
+            echo "Found binary in target directory"
+            cp "$PROJECT_DIR/target/${{ env.RUST_TARGET }}/release/$BINARY_NAME" "./$BINARY_NAME"
+          # Search for it
+          else
+            FOUND=$(find "$PROJECT_DIR" -name "$BINARY_NAME" -type f 2>/dev/null | head -1)
+            if [ -n "$FOUND" ]; then
+              echo "Found binary at: $FOUND"
+              cp "$FOUND" "./$BINARY_NAME"
+            else
+              echo "ERROR: Binary not found!"
+              echo "Files in project directory:"
+              ls -la "$PROJECT_DIR/"
+              echo "Files in target:"
+              find "$PROJECT_DIR/target" -type f -executable 2>/dev/null | head -10
+              exit 1
+            fi
+          fi
+
+      - name: Verify and strip binary
+        run: |
+          BINARY_NAME="${{ env.BINARY_NAME }}"
+          echo "=== Binary Information ==="
+          file "./$BINARY_NAME"
+          ls -lh "./$BINARY_NAME"
+          
+          # Strip if it's an ARM binary
+          if file "./$BINARY_NAME" | grep -q "ARM"; then
+            echo "Stripping ARM binary..."
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "./$BINARY_NAME"
+            echo "After stripping:"
+            ls -lh "./$BINARY_NAME"
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-android-arm64
+          path: ${{ env.BINARY_NAME }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.BINARY_NAME }}
+          generate_release_notes: true
